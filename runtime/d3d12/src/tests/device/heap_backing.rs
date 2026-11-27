@@ -448,6 +448,7 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
             ],
         ),
     ]);
+    let pools = PagePools::default();
     let init_transition = Mutex::new(None);
     let import = |guest: &Region, offset: u64, width: u64| {
         let size = (offset + width).next_multiple_of(PAGE);
@@ -461,6 +462,7 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
         };
         super::super::import::import_scattered_buffer(
             &native,
+            &pools,
             &init_transition,
             offset,
             &desc,
@@ -656,4 +658,108 @@ fn adjacent_placeholder_private_spans_import_check() {
 
     let _ = unsafe { VirtualFree(page0, 0, MEM_RELEASE) };
     let _ = unsafe { VirtualFree(page1, 0, MEM_RELEASE) };
+}
+
+#[test]
+fn retire_range_invalidates_imported_heap_and_prevents_cache_reuse() {
+    let Some(device) = hardware_device() else { return };
+    let home_a = Region::private(PAGE as usize);
+    let home_b = Region::private(PAGE as usize);
+    let guest = Region::reserved(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), home_a.address())]);
+
+    let pools = PagePools::default();
+    let backing_a = acquire(guest.address(), PAGE).unwrap();
+    let pin_a = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_a = pools
+        .import(&device, guest.address(), backing_a, PAGE, pin_a, "test", false)
+        .unwrap();
+    assert!(heap_a.is_live());
+
+    unsafe { crate::commands::page_mapping::retire_from_xmem(guest.address(), PAGE) };
+    assert!(!heap_a.is_live());
+    assert!(!heap_a.reusable_for(home_a.address()));
+
+    *MAP.lock().unwrap() = vec![(guest.address(), home_b.address())];
+    let backing_b = acquire(guest.address(), PAGE).unwrap();
+    let pin_b = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_b = pools
+        .import(&device, guest.address(), backing_b, PAGE, pin_b, "test", false)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&heap_a, &heap_b));
+    assert!(heap_b.is_live());
+
+    drop((heap_a, heap_b));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
+    drop(xmem);
+}
+
+#[test]
+fn scattered_imports_reuse_cached_piece_heaps() {
+    let Some(device) = hardware_device() else { return };
+    let native = device.clone();
+    let a = Region::private(PAGE as usize);
+    let b = Region::private(PAGE as usize);
+    let c = Region::private(PAGE as usize);
+    let guest_ab = Region::reserved((2 * PAGE) as usize);
+    let guest_ac = Region::reserved((2 * PAGE) as usize);
+
+    a.words(4).copy_from_slice(&[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+    let xmem = FakeXmem::install_runs(&[
+        (
+            guest_ab.address(),
+            vec![
+                BackingRun { address: a.address(), bytes: PAGE },
+                BackingRun { address: b.address(), bytes: PAGE },
+            ],
+        ),
+        (
+            guest_ac.address(),
+            vec![
+                BackingRun { address: a.address(), bytes: PAGE },
+                BackingRun { address: c.address(), bytes: PAGE },
+            ],
+        ),
+    ]);
+
+    let pools = PagePools::default();
+    let init_transition = Mutex::new(None);
+    let import = |guest: &Region| {
+        let AcquiredBacking::Scattered { runs, hold } = acquire_backing(guest.address(), 2 * PAGE).unwrap() else {
+            panic!("expected scattered backing");
+        };
+        let pin = GPU_APERTURE.pin(guest.address(), 2 * PAGE).unwrap();
+        super::super::import::import_scattered_buffer(
+            &native,
+            &pools,
+            &init_transition,
+            0,
+            &buffer_desc(2 * PAGE),
+            D3D12_RESOURCE_STATE_COMMON,
+            runs,
+            hold,
+            pin,
+            "test",
+            false,
+        )
+        .unwrap()
+    };
+
+    let (res_ab, heap_ab) = import(&guest_ab);
+    let (res_ac, heap_ac) = import(&guest_ac);
+    assert_eq!(heap_ab.native.as_raw(), heap_ac.native.as_raw());
+
+    drop((res_ab, heap_ab));
+    let readback = committed(&device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    submit(&device, |list| unsafe {
+        list.CopyBufferRegion(&readback, 0, &res_ac, 0, 16);
+    });
+    let mut out = core::ptr::null_mut();
+    unsafe { readback.Map(0, None, Some(&mut out)) }.unwrap();
+    let seen = unsafe { core::slice::from_raw_parts(out.cast::<u32>(), 4) };
+    assert_eq!(seen, &[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+
+    drop((readback, res_ac, heap_ac));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
+    drop(xmem);
 }

@@ -332,7 +332,14 @@ fn copy_page_mappings_can_unmap_and_remap_inside_contiguous_private_span() {
     let batch_remap = Batch { destination: gpu.addr() + PAGE, count: 1, ranges: &remap_mid };
     assert_eq!(unsafe { copy_page_mappings(1, &batch_remap, cpu.addr(), 3) }, 0);
     assert_eq!(query(gpu.addr() + PAGE).State, M_COMMIT);
-    assert_eq!(unsafe { gpu.cast::<u8>().add(PAGE).cast::<u32>().read() }, 0xcccc_3333);
+    let (mut remapped_backing, mut remapped_hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing((gpu.addr() + PAGE) as u64, PAGE as u64, &mut remapped_backing, &mut remapped_hold) },
+        1
+    );
+    assert_eq!(remapped_backing, (cpu.addr() + 2 * PAGE) as u64);
+    assert_eq!(unsafe { (remapped_backing as *const u32).read() }, 0xcccc_3333);
+    release_physical_backing(remapped_hold);
 
     // Unmap all GPU aliases and CPU views and release apertures cleanly.
     let unmap_all = PageRange { mode: 2, source: 0, count: 3 };
@@ -530,4 +537,179 @@ fn resolve_backings_does_not_coalesce_across_private_view_and_shared_section() {
     assert_eq!(unsafe { free(2, tokens.as_ptr()) }, 1);
     assert_ne!(unsafe { VirtualFree(alias, 0, MEM_RELEASE) }, 0);
     assert_ne!(unsafe { VirtualFree(span, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn unheld_private_arena_adopts_new_cpu_view_without_section_promotion() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+
+    let initial = reserve_aperture(1);
+    let gpu = reserve_aperture(1);
+    let cpu = reserve_aperture(1);
+    assert!(!initial.is_null() && !gpu.is_null() && !cpu.is_null());
+
+    assert_eq!(unsafe { map(initial, 1, &token) }, initial);
+    unsafe { initial.cast::<u32>().write(0x1234_5678) };
+    let range = PageRange { mode: 0, source: 0, count: 1 };
+    let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
+    assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);
+
+    let (mut backing, mut hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut backing, &mut hold) },
+        1
+    );
+    assert_ne!(backing, gpu.addr() as u64);
+    unsafe { (backing as *mut u32).write(0xaabb_ccdd) };
+    release_physical_backing(hold);
+
+    // After the arena hold is released, mapping a new CPU view should adopt it as a
+    // zero-copy private view instead of keeping a SecondaryAlias and promoting to SharedSection.
+    assert_eq!(unsafe { map(cpu, 1, &token) }, cpu);
+    let info = query(cpu.addr());
+    assert_eq!(info.Type, MEM_PRIVATE);
+    assert_eq!(info.Protect, PAGE_READWRITE);
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0xaabb_ccdd);
+
+    let (mut next, mut next_hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut next, &mut next_hold) },
+        1
+    );
+    assert_eq!(next, cpu.addr() as u64);
+    unsafe { (next as *mut u32).write(0x55aa_55aa) };
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0x55aa_55aa);
+
+    release_physical_backing(next_hold);
+    assert_eq!(unsafe { map(gpu, 1, ptr::null()) }, gpu);
+    assert_eq!(unsafe { map(cpu, 1, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    for a in [initial, gpu, cpu] {
+        assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
+    }
+}
+
+#[test]
+fn held_private_arena_promotion_notifies_invalidation_and_keeps_hold_live() {
+    use std::sync::Mutex as StdMutex;
+    static EVENTS: StdMutex<Vec<(u64, u64)>> = StdMutex::new(Vec::new());
+    unsafe extern "system" fn record(address: u64, bytes: u64) {
+        EVENTS.lock().unwrap().push((address, bytes));
+    }
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    EVENTS.lock().unwrap().clear();
+    set_backing_invalidation_callback(Some(record));
+
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+
+    let initial = reserve_aperture(1);
+    let gpu = reserve_aperture(1);
+    let cpu = reserve_aperture(1);
+    assert!(!initial.is_null() && !gpu.is_null() && !cpu.is_null());
+
+    assert_eq!(unsafe { map(initial, 1, &token) }, initial);
+    unsafe { initial.cast::<u32>().write(0x1234_5678) };
+    let range = PageRange { mode: 0, source: 0, count: 1 };
+    let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
+    assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);
+
+    let (mut backing, mut hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut backing, &mut hold) },
+        1
+    );
+    assert_ne!(backing, gpu.addr() as u64);
+
+    // Map `cpu` while the PrivateArena hold is still live and touch it to promote to SharedSection.
+    assert_eq!(unsafe { map(cpu, 1, &token) }, cpu);
+    let promoted = unsafe { cpu.cast::<u32>().read() };
+    assert_eq!(promoted, 0x1234_5678);
+
+    {
+        let recorded = EVENTS.lock().unwrap();
+        assert!(recorded.contains(&(gpu.addr() as u64, PAGE as u64)));
+        assert!(recorded.contains(&(cpu.addr() as u64, PAGE as u64)));
+    }
+    // The held arena pointer stays committed MEM_PRIVATE/PAGE_READWRITE until its hold releases.
+    let old_info = query(backing as usize);
+    assert_eq!(old_info.State, M_COMMIT);
+    assert_eq!(old_info.Type, MEM_PRIVATE);
+    assert_eq!(old_info.Protect, PAGE_READWRITE);
+
+    // Re-acquiring the GPU alias now resolves to the promoted SharedSection view, coherent with `cpu`.
+    let (mut next, mut next_hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut next, &mut next_hold) },
+        1
+    );
+    assert_eq!(next, gpu.addr() as u64);
+    unsafe { (next as *mut u32).write(0x55aa_55aa) };
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0x55aa_55aa);
+
+    set_backing_invalidation_callback(None);
+    release_physical_backing(next_hold);
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(gpu, 1, ptr::null()) }, gpu);
+    assert_eq!(unsafe { map(cpu, 1, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    for a in [initial, gpu, cpu] {
+        assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
+    }
+}
+
+#[test]
+fn is_physical_backed_does_not_allocate_private_arena_for_unbacked_gpu_alias() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+
+    let initial = reserve_aperture(1);
+    let gpu = reserve_aperture(1);
+    let cpu = reserve_aperture(1);
+    assert!(!initial.is_null() && !gpu.is_null() && !cpu.is_null());
+
+    assert_eq!(unsafe { map(initial, 1, &token) }, initial);
+    unsafe { initial.cast::<u32>().write(0x1234_5678) };
+    let range = PageRange { mode: 0, source: 0, count: 1 };
+    let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
+    // Copying a GPU alias must not dirty its alias page with the source contents.
+    assert_eq!(unsafe { gpu.cast::<u32>().read() }, 0);
+
+    // Unmapping `initial` leaves `token` Unbacked while `gpu` remains mapped.
+    assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);
+    assert_eq!(unsafe { is_physical_backed(gpu.addr() as u64, PAGE as u64) }, 1);
+    assert_eq!(unsafe { is_physical_backed(initial.addr() as u64, PAGE as u64) }, 0);
+
+    // Because `is_physical_backed` is read-only and did not allocate a PrivateArena,
+    // mapping `cpu` adopts the token directly as MEM_PRIVATE zero-copy.
+    assert_eq!(unsafe { map(cpu, 1, &token) }, cpu);
+    let info = query(cpu.addr());
+    assert_eq!(info.Type, MEM_PRIVATE);
+    assert_eq!(info.Protect, PAGE_READWRITE);
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0x1234_5678);
+
+    let (mut backing, mut hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut backing, &mut hold) },
+        1
+    );
+    assert_eq!(backing, cpu.addr() as u64);
+
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(gpu, 1, ptr::null()) }, gpu);
+    assert_eq!(unsafe { map(cpu, 1, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    for a in [initial, gpu, cpu] {
+        assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
+    }
 }

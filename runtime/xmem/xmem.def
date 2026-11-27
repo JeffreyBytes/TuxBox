@@ -39,6 +39,8 @@ EXPORTS
     TuxBoxAcquirePhysicalBacking PRIVATE
     TuxBoxAcquirePhysicalBackingRuns PRIVATE
     TuxBoxCopyPageMappings PRIVATE
+    TuxBoxIsPhysicalBacked PRIVATE
     TuxBoxReleasePhysicalBacking PRIVATE
+    TuxBoxSetBackingInvalidationCallback PRIVATE
     TuxBoxValidatePinnedPageMappings PRIVATE
     TuxBoxWritePhysicalPages PRIVATE

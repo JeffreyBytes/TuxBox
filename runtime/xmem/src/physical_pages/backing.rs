@@ -2,11 +2,14 @@
 use super::{PAGE, Pool, shared_pages};
 use core::ptr;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NOT_ENOUGH_MEMORY,
     ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, GetLastError, SetLastError,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
 };
@@ -22,6 +25,7 @@ pub struct BackingRun {
 /// live CPU view covers them.
 pub(super) struct PrivateArena {
     base: usize,
+    bytes: usize,
 }
 
 impl PrivateArena {
@@ -37,11 +41,18 @@ impl PrivateArena {
                 error => error,
             });
         }
-        Ok(Arc::new(Self { base: base.addr() }))
+        Ok(Arc::new(Self {
+            base: base.addr(),
+            bytes,
+        }))
     }
 
     pub(super) fn base(&self) -> usize {
         self.base
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -90,11 +101,31 @@ fn failure(code: u32) -> i32 {
     0
 }
 
+pub(super) type BackingInvalidationCallback = unsafe extern "system" fn(u64, u64);
+
+static BACKING_INVALIDATION_CB: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn notify_backing_invalidated(vas: &[usize]) {
+    let raw = BACKING_INVALIDATION_CB.load(Ordering::Acquire);
+    if raw == 0 || vas.is_empty() {
+        return;
+    }
+    // SAFETY: `raw` was stored from a valid `BackingInvalidationCallback` pointer.
+    let cb: BackingInvalidationCallback = unsafe { core::mem::transmute(raw) };
+    for &va in vas {
+        unsafe { cb(va as u64, PAGE as u64) };
+    }
+}
+
 impl Pool {
     pub(super) fn has_hold(&self, start: usize, end: usize) -> bool {
         (start..end)
             .step_by(PAGE)
             .any(|va| self.view_holds.get(&va).copied().unwrap_or(0) > 0)
+    }
+
+    pub(super) fn arena_has_hold(&self, base: usize) -> bool {
+        self.arena_holds.get(&base).copied().unwrap_or(0) > 0
     }
 
     /// Resolve a 64 KiB-aligned guest range into canonical `MEM_PRIVATE` host
@@ -216,6 +247,55 @@ impl Pool {
         Ok((runs, HoldRecord { arenas, pinned_views }))
     }
 
+    fn trace_backing_stats(&self) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var("TUXBOX_TRACE_XMEM_BACKING").as_deref() == Ok("1")
+        }) {
+            return;
+        }
+        static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+        let now = Instant::now();
+        {
+            let mut last = LAST_LOG.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = *last
+                && now.duration_since(prev) < Duration::from_secs(5)
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        let mut seen_arenas: HashMap<usize, usize> = HashMap::new();
+        for page in self.pages.values() {
+            if let PageBacking::PrivateArena { arena, .. } = &page.backing {
+                seen_arenas.entry(arena.base()).or_insert_with(|| arena.bytes());
+            }
+        }
+        for record in self.holds.values() {
+            for arena in &record.arenas {
+                seen_arenas.entry(arena.base()).or_insert_with(|| arena.bytes());
+            }
+        }
+        let arena_bytes: usize = seen_arenas.values().sum();
+        let page_mib = (self.pages.len() * PAGE) >> 20;
+        let view_mib = (self.view_holds.len() * PAGE) >> 20;
+        let arena_mib = arena_bytes >> 20;
+        let msg = format!(
+            "TuxBox xmem: backing stats pages={} ({} MiB) holds={} view_holds={} ({} MiB) arena_holds={} live_arenas={} ({} MiB) deferred={}\n\0",
+            self.pages.len(),
+            page_mib,
+            self.holds.len(),
+            self.view_holds.len(),
+            view_mib,
+            self.arena_holds.len(),
+            seen_arenas.len(),
+            arena_mib,
+            self.deferred_unmaps.len(),
+        );
+        // SAFETY: `msg` is nul-terminated.
+        unsafe { OutputDebugStringA(msg.as_ptr()) };
+    }
+
     pub(super) fn commit_hold(&mut self, record: HoldRecord) -> Result<u64, u32> {
         self.next_hold += 1;
         let id = self.next_hold;
@@ -225,15 +305,31 @@ impl Pool {
         self.view_holds
             .try_reserve(record.pinned_views.len())
             .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+        self.arena_holds
+            .try_reserve(record.arenas.len())
+            .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
         for &va in &record.pinned_views {
             *self.view_holds.entry(va).or_insert(0) += 1;
         }
+        for arena in &record.arenas {
+            *self.arena_holds.entry(arena.base()).or_insert(0) += 1;
+        }
         self.holds.insert(id, record);
+        self.trace_backing_stats();
         Ok(id)
     }
 
     pub(super) fn release_hold(&mut self, id: u64) -> Option<Vec<Arc<PrivateArena>>> {
         let record = self.holds.remove(&id)?;
+        for arena in &record.arenas {
+            let base = arena.base();
+            if let Some(count) = self.arena_holds.get_mut(&base) {
+                *count -= 1;
+                if *count == 0 {
+                    self.arena_holds.remove(&base);
+                }
+            }
+        }
         let mut released_vas = Vec::new();
         for &va in &record.pinned_views {
             if let Some(count) = self.view_holds.get_mut(&va) {
@@ -245,6 +341,7 @@ impl Pool {
             }
         }
         self.flush_deferred_unmaps(&released_vas);
+        self.trace_backing_stats();
         Some(record.arenas)
     }
 
@@ -498,6 +595,32 @@ pub extern "system" fn release_physical_backing(hold: u64) {
         pool.release_hold(hold)
     };
     drop(arenas);
+}
+
+/// Read-only check returning `1` when every 64 KiB page in `address..address+bytes`
+/// is currently mapped in `Pool` without allocating or pinning any backing.
+#[unsafe(export_name = "TuxBoxIsPhysicalBacked")]
+pub unsafe extern "system" fn is_physical_backed(address: u64, bytes: u64) -> i32 {
+    let (Ok(addr), Ok(len)) = (usize::try_from(address), usize::try_from(bytes)) else {
+        return 0;
+    };
+    let Some(end) = addr.checked_add(len) else {
+        return 0;
+    };
+    if addr == 0 || len == 0 || !addr.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+        return 0;
+    }
+    let pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
+    i32::from((addr..end).step_by(PAGE).all(|va| pool.mappings.contains_key(&va)))
+}
+
+/// Register or clear the callback notified when lazy section promotion retires
+/// a held `PrivateArena` backing at one or more guest virtual addresses.
+#[unsafe(export_name = "TuxBoxSetBackingInvalidationCallback")]
+pub extern "system" fn set_backing_invalidation_callback(
+    callback: Option<BackingInvalidationCallback>,
+) {
+    BACKING_INVALIDATION_CB.store(callback.map_or(0, |f| f as usize), Ordering::Release);
 }
 
 #[cfg(test)]

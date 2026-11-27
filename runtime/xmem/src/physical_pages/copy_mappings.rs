@@ -54,7 +54,6 @@ impl Pool {
             && !self.has_hold(at, at + PAGE)
             && !matches!(self.pages[&new_token].backing, PageBacking::SharedSection)
         {
-            self.populate_page_bytes(new_token, at as *mut u8, true)?;
             if let Some(prev_token) = previous {
                 self.pages.get_mut(&prev_token).expect("previous mapping valid").aliases -= 1;
             }

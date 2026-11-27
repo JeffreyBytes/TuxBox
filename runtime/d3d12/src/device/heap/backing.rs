@@ -53,23 +53,27 @@ type Acquire = unsafe extern "system" fn(u64, u64, *mut u64, *mut u64) -> i32;
 type AcquireRuns =
     unsafe extern "system" fn(u64, u64, *mut BackingRun, *mut u32, *mut u64) -> i32;
 type Release = unsafe extern "system" fn(u64);
+type IsBacked = unsafe extern "system" fn(u64, u64) -> i32;
+type SetInvalidationCallback =
+    unsafe extern "system" fn(Option<unsafe extern "system" fn(u64, u64)>);
 
 #[derive(Clone, Copy)]
 pub(super) struct Exports {
     acquire: Acquire,
     acquire_runs: Option<AcquireRuns>,
     release: Release,
+    is_backed: Option<IsBacked>,
 }
 
 impl Exports {
     #[cfg(test)]
     pub(super) fn new(acquire: Acquire, release: Release) -> Self {
-        Self { acquire, acquire_runs: None, release }
+        Self { acquire, acquire_runs: None, release, is_backed: None }
     }
 
     #[cfg(test)]
     pub(super) fn with_runs(acquire: Acquire, acquire_runs: AcquireRuns, release: Release) -> Self {
-        Self { acquire, acquire_runs: Some(acquire_runs), release }
+        Self { acquire, acquire_runs: Some(acquire_runs), release, is_backed: None }
     }
 }
 
@@ -82,10 +86,21 @@ fn lookup() -> Option<Exports> {
             |symbol| core::mem::transmute::<unsafe extern "system" fn() -> isize, AcquireRuns>(symbol),
         );
         let release = GetProcAddress(module, s!("TuxBoxReleasePhysicalBacking"))?;
+        let is_backed = GetProcAddress(module, s!("TuxBoxIsPhysicalBacked")).map(
+            |symbol| core::mem::transmute::<unsafe extern "system" fn() -> isize, IsBacked>(symbol),
+        );
+        if let Some(register) = GetProcAddress(module, s!("TuxBoxSetBackingInvalidationCallback")) {
+            let set_cb: SetInvalidationCallback = core::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetInvalidationCallback,
+            >(register);
+            set_cb(Some(crate::commands::page_mapping::retire_from_xmem));
+        }
         Some(Exports {
             acquire: core::mem::transmute::<unsafe extern "system" fn() -> isize, Acquire>(acquire),
             acquire_runs,
             release: core::mem::transmute::<unsafe extern "system" fn() -> isize, Release>(release),
+            is_backed,
         })
     }
 }
@@ -306,6 +321,12 @@ pub(in super::super) fn is_backed_range(start: u64, end: u64) -> bool {
     let Some(page_end) = end.checked_next_multiple_of(65536) else {
         return false;
     };
+    let Some(exports) = exports() else {
+        return false;
+    };
+    if let Some(is_backed) = exports.is_backed {
+        return unsafe { is_backed(page_start, page_end - page_start) != 0 };
+    }
     matches!(acquired_runs(page_start, page_end - page_start), Ok(Some(_)))
 }
 

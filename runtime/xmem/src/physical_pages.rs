@@ -62,6 +62,7 @@ struct Pool {
     next_hold: u64,
     holds: HashMap<u64, HoldRecord>,
     view_holds: HashMap<usize, usize>,
+    arena_holds: HashMap<usize, usize>,
     deferred_unmaps: HashMap<usize, DeferredKind>,
 }
 
