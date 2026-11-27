@@ -220,7 +220,7 @@ fn next_bit(valid: &[u64], mut at: usize, limit: usize, set: bool) -> usize {
     at.min(limit)
 }
 
-fn query_region(address: usize) -> Result<(usize, MEMORY_BASIC_INFORMATION)> {
+pub(super) fn query_region(address: usize) -> Result<(usize, MEMORY_BASIC_INFORMATION)> {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: VirtualQuery probes the address and fills a local structure.
     if unsafe {
@@ -240,7 +240,7 @@ fn query_region(address: usize) -> Result<(usize, MEMORY_BASIC_INFORMATION)> {
     Ok((end, info))
 }
 
-fn mapped_region(info: &MEMORY_BASIC_INFORMATION) -> bool {
+pub(super) fn mapped_region(info: &MEMORY_BASIC_INFORMATION) -> bool {
     info.State == MEM_COMMIT && info.Protect.0 & 0xff != PAGE_NOACCESS.0
 }
 

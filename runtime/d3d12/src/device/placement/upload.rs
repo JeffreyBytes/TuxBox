@@ -114,6 +114,7 @@ impl Transfer {
             return Err(error);
         }
         for change in changes {
+            change.texture.uploaded();
             let mut state = lock(&change.texture.contents);
             self.scratch = std::mem::replace(&mut state.previous[change.level], change.bytes);
             state.uploaded = tick;

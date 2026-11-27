@@ -93,6 +93,8 @@ impl Backing {
 }
 pub(crate) struct ResourceState {
     backing: Backing,
+    /// Counts this title object on its placed image under `TUXBOX_TRACE_GPU_MEMORY=1`.
+    _title: Option<placement::TitleRef>,
     texture_address: std::sync::OnceLock<std::sync::Arc<views::TextureAddress>>,
     blas_buffer: Option<blas::Registration>,
     stencil: std::sync::OnceLock<std::sync::Arc<stencil::Surface>>,
@@ -130,6 +132,7 @@ impl ResourceState {
 impl From<Backing> for ResourceState {
     fn from(backing: Backing) -> Self {
         Self {
+            _title: backing.placed().and_then(|texture| texture.title_ref()),
             backing,
             texture_address: Default::default(),
             blas_buffer: None,

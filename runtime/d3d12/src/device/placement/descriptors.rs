@@ -132,6 +132,7 @@ pub(crate) struct PlacedView {
 
 impl DescriptorMap<PlacedView> {
     pub(crate) fn set(&self, handle: usize, texture: Option<&Arc<super::Texture>>, writable: bool) {
+        if let Some(texture) = texture { texture.viewed(); }
         self.store(handle, texture.map(|t| PlacedView { texture: Arc::downgrade(t), writable }));
     }
 

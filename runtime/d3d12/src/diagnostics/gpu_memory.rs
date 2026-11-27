@@ -82,7 +82,6 @@ const SLOTS: usize = Slot::SnapshotRam as usize + 1;
 #[derive(Clone, Copy)]
 pub(crate) enum Origin {
     Guest,
-    GuestTextureCopy,
     ViewMirror,
     Standin,
     Staging,
@@ -187,6 +186,12 @@ unsafe extern "system" fn marker_release(this: *mut Marker) -> u32 {
 }
 
 fn track(object: &ID3D12Object, slot: Slot, bytes: u64) {
+    track_quiet(object, slot, bytes);
+    tick();
+}
+
+/// Count without reporting, for callers that hold a lock the report takes.
+fn track_quiet(object: &ID3D12Object, slot: Slot, bytes: u64) {
     COUNTERS[slot as usize].add(bytes);
     let marker = Box::into_raw(Box::new(Marker { vtable: &MARKER_VTABLE, refs: AtomicU32::new(1), slot, bytes }));
     // SAFETY: the marker is a live COM object with one reference, which this
@@ -195,7 +200,6 @@ fn track(object: &ID3D12Object, slot: Slot, bytes: u64) {
     let marker = unsafe { IUnknown::from_raw(marker.cast()) };
     let _ = unsafe { object.SetPrivateDataInterface(&MARKER, &marker) };
     drop(marker);
-    tick();
 }
 
 /// Texture class from the usage flags: (plain, render target or depth, UAV only).
@@ -280,7 +284,6 @@ pub(crate) fn committed(resource: &ID3D12Resource, origin: Origin) {
                 class(&desc, [Slot::CommittedTexture, Slot::CommittedTarget, Slot::CommittedUav, Slot::CommittedBuffer])
             }
         }
-        Origin::GuestTextureCopy => Slot::GuestTextureCopy,
         Origin::ViewMirror => Slot::ViewMirror,
         Origin::Standin => Slot::Standin,
         Origin::Staging => Slot::Staging,
@@ -288,6 +291,30 @@ pub(crate) fn committed(resource: &ID3D12Resource, origin: Origin) {
         Origin::Internal => Slot::Internal,
     };
     track(resource, slot, size(resource, &desc));
+}
+
+/// The native image copying a texture placed in guest memory. Returns its
+/// approximate bytes when tracing, for the per-image usage record. Does not
+/// report: the caller holds the placed image table's lock.
+pub(crate) fn guest_texture_copy(resource: &ID3D12Resource) -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
+    // SAFETY: the resource is live.
+    let bytes = size(resource, &unsafe { resource.GetDesc() });
+    track_quiet(resource, Slot::GuestTextureCopy, bytes);
+    Some(bytes)
+}
+
+/// Live native guest texture copies and their bytes.
+pub(crate) fn guest_texture_copies() -> [u64; 2] {
+    let [live, bytes, ..] = COUNTERS[Slot::GuestTextureCopy as usize].read();
+    [live, bytes]
+}
+
+/// Live bytes of one host RAM category (an upper bound for snapshots).
+pub(crate) fn host_ram_bytes(slot: Slot) -> u64 {
+    COUNTERS[slot as usize].read()[1]
 }
 
 /// A resource placed in a heap. Its bytes are already counted with the heap.
@@ -341,6 +368,11 @@ const PERIOD_MS: u64 = 5000;
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 static LAST_MS: AtomicU64 = AtomicU64::new(0);
 static REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since the trace started.
+pub(crate) fn now_ms() -> u64 {
+    START.elapsed().as_millis() as u64
+}
 
 /// Called from creation hooks and every queue submission.
 pub(crate) fn tick() {
@@ -440,6 +472,7 @@ fn report(reason: &str) {
         churn("committed", &COMMITTED), churn("internal", &INTERNAL),
         churn("placed", &PLACED), churn("reserved", &[Slot::Reserved]),
     ));
+    crate::device::placement::usage_report(&log);
 }
 
 #[cfg(test)]

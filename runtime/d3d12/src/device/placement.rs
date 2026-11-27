@@ -2,9 +2,11 @@
 mod descriptors;
 mod publication;
 mod upload;
+mod usage;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
 pub(crate) use publication::QueueAccess;
+pub(crate) use usage::{TitleRef, report as usage_report};
 
 use super::Device;
 use core::{ffi::c_void, ops::Range};
@@ -114,6 +116,8 @@ pub(crate) struct Texture {
     mips: Vec<Mip>,
     contents: Mutex<Contents>,
     images: Weak<Images>,
+    /// Present only under `TUXBOX_TRACE_GPU_MEMORY=1`.
+    usage: Option<Arc<usage::Usage>>,
 }
 
 impl Drop for Texture {
@@ -257,7 +261,7 @@ impl Texture {
             D3D12_RESOURCE_STATE_COMMON,
             clear,
         )?;
-        crate::diagnostics::gpu_memory::committed(&native, crate::diagnostics::gpu_memory::Origin::GuestTextureCopy);
+        let usage = usage::Usage::new(&native);
         let mut mips = Vec::with_capacity(count as usize);
         for index in 0..count {
             let (slice, level, element_bytes, source) = if let Some(p) = &plane {
@@ -324,6 +328,7 @@ impl Texture {
             mips,
             contents,
             images: Arc::downgrade(images),
+            usage,
         }))
     }
 
@@ -345,9 +350,11 @@ impl Texture {
         scratch: &mut Vec<u8>,
     ) -> Result<()> {
         let mut contents = lock(&self.contents);
+        let mut readable = true;
         for (level, mip) in self.mips.iter().enumerate() {
             if !self.snapshot_mip(mip, scratch)? {
                 contents.previous[level].clear();
+                readable = false;
                 continue;
             }
             if *scratch != contents.previous[level] {
@@ -358,6 +365,7 @@ impl Texture {
                 });
             }
         }
+        self.checked(readable);
         Ok(())
     }
 }
@@ -620,6 +628,7 @@ pub(crate) unsafe fn submit(
 ) -> Result<()> {
     let device = unsafe { &*device.cast::<Device>() };
     let placements = &device.state.placements;
+    usage::submitted(textures, writes, true);
     placements.views.gather(heaps, textures, writes);
     unique(writes);
     textures
@@ -632,6 +641,7 @@ pub(crate) unsafe fn submit(
         return execute();
     }
     unique(textures);
+    usage::submitted(textures, &[], false);
     // Distinct images over the same guest memory cannot be ordered inside one
     // submission. Each is refreshed from guest memory and the writer publishes
     // afterwards, so a pass that really reads data another pass wrote in this
