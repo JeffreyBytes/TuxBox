@@ -74,6 +74,7 @@ impl Readback {
             D3D12_RESOURCE_STATE_COPY_DEST,
             None,
         )?;
+        crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::Staging);
         // SAFETY: the new allocator and command list belong to this device;
         // both, the buffer and the source textures are retained to completion.
         let allocator = unsafe { device.CreateCommandAllocator(kind)? };

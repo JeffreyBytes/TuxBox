@@ -304,6 +304,7 @@ pub(crate) fn watch(kind: &str, start: u64, len: u64, detail: impl FnOnce() -> S
 /// With `TUXBOX_TRACE_PRESENT`, count GPU writes aimed at display resources
 /// (created with ALLOW_DISPLAY) so a black presented image can be attributed.
 pub(crate) mod null_usage;
+pub(crate) mod gpu_memory;
 
 pub(crate) mod display {
     use std::collections::{HashMap, HashSet};

@@ -167,6 +167,7 @@ pub(super) fn cbv_mirror(device: &Device, address: u64, guest_bytes: u32, deskto
     let Some(buffer) = native else {
         return Err(windows::Win32::Foundation::E_FAIL.into());
     };
+    crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::ViewMirror);
     let mut mapped = core::ptr::null_mut();
     let unread = D3D12_RANGE { Begin: 0, End: 0 };
     // SAFETY: the upload buffer has `desktop_bytes` bytes and is not mapped yet.
@@ -309,6 +310,7 @@ pub(super) fn srv_mirror(device: &Device, address: u64, bytes: u64) -> windows::
     let Some(buffer) = native else {
         return Err(windows::Win32::Foundation::E_FAIL.into());
     };
+    crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::ViewMirror);
     let mut mapped = core::ptr::null_mut();
     let unread = D3D12_RANGE { Begin: 0, End: 0 };
     unsafe { buffer.Map(0, Some(&unread), Some(&mut mapped))? };

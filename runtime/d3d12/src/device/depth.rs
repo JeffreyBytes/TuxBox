@@ -118,7 +118,9 @@ impl Pair {
                     &mut result,
                 )?
             };
-            result.ok_or_else(|| windows::core::Error::from(E_POINTER))
+            let result: ID3D12Resource = result.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+            crate::diagnostics::gpu_memory::committed(&result, crate::diagnostics::gpu_memory::Origin::Internal);
+            Ok::<_, windows::core::Error>(result)
         };
         Ok(Self {
             guest: *guest,

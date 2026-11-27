@@ -254,6 +254,7 @@ fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
     unsafe {
         let completed = fence.GetCompletedValue();
         if completed == u64::MAX {
+            crate::diagnostics::gpu_memory::report_now("device removed");
             return Err(DXGI_ERROR_DEVICE_REMOVED.into());
         }
         if completed < value {
@@ -363,6 +364,7 @@ pub(crate) mod sampler {
                 D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer).ok()?;
         }
         let buffer = buffer?;
+        crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::Staging);
         let barrier = |before, after| D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

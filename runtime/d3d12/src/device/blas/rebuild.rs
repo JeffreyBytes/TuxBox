@@ -45,6 +45,9 @@ pub(super) fn buffer(
             &mut native,
         )
     }?;
+    if let Some(native) = &native {
+        crate::diagnostics::gpu_memory::committed(native, crate::diagnostics::gpu_memory::Origin::Blas);
+    }
     native.ok_or_else(|| E_POINTER.into())
 }
 

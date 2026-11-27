@@ -148,6 +148,9 @@ fn staging_buffer(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
             &mut native,
         )?;
     }
+    if let Some(native) = &native {
+        crate::diagnostics::gpu_memory::committed(native, crate::diagnostics::gpu_memory::Origin::Staging);
+    }
     native.ok_or_else(|| E_FAIL.into())
 }
 

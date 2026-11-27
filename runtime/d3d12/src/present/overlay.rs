@@ -202,6 +202,7 @@ fn create_upload(device: &ID3D12Device, pitch: u32, height: u32) -> Result<Uploa
             &mut buffer,
         )?;
         let buffer = buffer.ok_or(E_POINTER)?;
+        crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::Internal);
         buffer.Map(0, None, Some(&mut mapped))?;
         if mapped.is_null() {
             return Err(E_POINTER.into());

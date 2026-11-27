@@ -184,6 +184,7 @@ pub(super) unsafe extern "system" fn create(
     };
     // GetDesc reflects the size and alignment the driver actually granted.
     let actual = unsafe { native.GetDesc() };
+    crate::diagnostics::gpu_memory::native_heap(&native, false);
     unsafe { wrap_pageable(Ok(native), &HEAP, device, actual, out) }
 }
 
@@ -377,6 +378,9 @@ pub(super) unsafe extern "system" fn place(
     } {
         return report("host", error.code());
     }
+    if let Some(native) = &native {
+        crate::diagnostics::gpu_memory::placed(native, false);
+    }
     unsafe {
         super::depth::wrap::<false>(
             device,
@@ -473,6 +477,7 @@ impl RenderHeaps {
         let mut native = None;
         unsafe { device.CreateHeap(&desc, &mut native)? };
         let heap = Arc::new(RenderHeap { native: native.ok_or(E_POINTER)?, end: stop });
+        crate::diagnostics::gpu_memory::native_heap(&heap.native, true);
         heaps.insert(start, Arc::downgrade(&heap));
         Ok((heap, address - start))
     }
@@ -568,6 +573,7 @@ unsafe fn place_gpu_target(
             (!formats.is_empty()).then_some(formats), &mut resource)? };
         let resource: ID3D12Resource = resource.ok_or(E_POINTER)?;
         unsafe { resource.SetPrivateDataInterface(&IMPORTED_HEAP, &heap)? };
+        crate::diagnostics::gpu_memory::placed(&resource, false);
         if crate::diagnostics::display::enabled() && renderable && desc.Width >= 1920 {
             crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
                 "placed render image res={:#x} at {address:#x}+{:#x} {}x{} format={}",
@@ -657,6 +663,7 @@ pub(super) unsafe extern "system" fn committed_layout(
         return error.code();
     }
     let Some(native) = native else { return E_POINTER; };
+    crate::diagnostics::gpu_memory::committed(&native, crate::diagnostics::gpu_memory::Origin::Guest);
     if flags.contains(D3D12_HEAP_FLAG_ALLOW_DISPLAY) {
         crate::diagnostics::display::mark_resource(native.as_raw());
     }

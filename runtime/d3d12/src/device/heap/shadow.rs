@@ -50,6 +50,7 @@ impl Drop for AllocGuard {
 
 impl Drop for ShadowPages {
     fn drop(&mut self) {
+        crate::diagnostics::gpu_memory::host_ram_released(crate::diagnostics::gpu_memory::Slot::ShadowRam, 2 * self.size as u64);
         if self.shadow_base != 0 {
             // SAFETY: `shadow_base` was allocated by `VirtualAlloc(MEM_RESERVE | MEM_COMMIT)`
             // and outlives `ImportedHeap::native` (declared earlier in `ImportedHeap`).
@@ -83,6 +84,8 @@ impl ShadowPages {
         unsafe { core::ptr::copy_nonoverlapping(baseline.as_ptr(), shadow_ptr.cast(), size) };
         let shadow_base = guard.0;
         guard.0 = 0;
+        // The anonymous copy the GPU reads plus the baseline it is diffed against.
+        crate::diagnostics::gpu_memory::host_ram(crate::diagnostics::gpu_memory::Slot::ShadowRam, 2 * size as u64);
         Ok(Arc::new(Self {
             guest_base,
             shadow_base,

@@ -41,6 +41,7 @@ impl ImportedHeap {
         pin: ImportPin,
         backing: super::backing::Backing,
     ) -> windows::core::Result<Self> {
+        crate::diagnostics::gpu_memory::imported_heap(&native);
         if let Some(guard) = BackingGuard::new(None, backing.hold) {
             attach_heap_guard(&native, &guard)?;
         }
@@ -53,6 +54,7 @@ impl ImportedHeap {
         shadow: Arc<super::shadow::ShadowPages>,
         backing: super::backing::Backing,
     ) -> windows::core::Result<Self> {
+        crate::diagnostics::gpu_memory::imported_heap(&native);
         if let Some(guard) = BackingGuard::new(Some(shadow), backing.hold) {
             attach_heap_guard(&native, &guard)?;
         }
@@ -151,6 +153,7 @@ pub(super) fn import_scattered_buffer(
     let mut resource = None;
     unsafe { native_device.CreateReservedResource(&reserved_desc, state, None, &mut resource)? };
     let resource: ID3D12Resource = resource.ok_or(E_POINTER)?;
+    crate::diagnostics::gpu_memory::reserved(&resource);
     super::super::allocation::map_reserved_tiles(native_device, init_transition, &resource, &heaps)?;
     drop(heaps);
     let primary = piece_heaps[0].native.clone();
@@ -250,6 +253,7 @@ pub(in super::super) fn import_buffer_with_heap(
     let mut resource = None;
     unsafe { device.native.CreatePlacedResource(&heap.native, offset, &host_desc, state, None, &mut resource)? };
     let resource: ID3D12Resource = resource.ok_or(E_POINTER)?;
+    crate::diagnostics::gpu_memory::placed(&resource, true);
     // Placed resources borrow their heap. Keep the imported CPU allocation's
     // heap alive through the final native resource reference (including views).
     attach_import(&resource, &heap)?;
@@ -333,6 +337,7 @@ pub(super) fn buffer_standin(device: &Device, address: u64, desc: &D3D12_RESOURC
         return Err(error);
     }
     let native = device_buffer(device, desc, state)?;
+    crate::diagnostics::gpu_memory::committed(&native, crate::diagnostics::gpu_memory::Origin::Standin);
     trace_buffer_path("device_standin", &FALLBACK, source, desc.Width);
     static DEVICE: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&DEVICE, || format!(
@@ -374,7 +379,8 @@ impl ImportedHeap {
         }
         let mut alias = None;
         unsafe { device.CreatePlacedResource(&self.native, start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut alias)? };
-        let alias = alias.ok_or(E_POINTER)?;
+        let alias: ID3D12Resource = alias.ok_or(E_POINTER)?;
+        crate::diagnostics::gpu_memory::placed(&alias, true);
         attach_import(&alias, self)?;
         Ok((alias, first))
     }

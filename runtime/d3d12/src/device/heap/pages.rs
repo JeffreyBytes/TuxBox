@@ -62,6 +62,7 @@ impl PagePools {
                     trace_import_failure(source, "scattered-sized", bytes, error.code());
                     error
                 })?;
+            crate::diagnostics::gpu_memory::imported_heap(&native);
             attach_heap_guard(&native, guard)?;
             Ok(Arc::new(PieceHeap { native }))
         };

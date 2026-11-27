@@ -176,6 +176,7 @@ impl Upload {
             D3D12_RESOURCE_STATE_GENERIC_READ,
             None,
         )?;
+        crate::diagnostics::gpu_memory::committed(&buffer, crate::diagnostics::gpu_memory::Origin::Staging);
         let allocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)? };
         let list: ID3D12GraphicsCommandList =
             unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)? };

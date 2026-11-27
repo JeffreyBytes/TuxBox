@@ -127,6 +127,13 @@ pub(super) unsafe extern "system" fn update(
         } else {
             Some(unsafe { device::memory_heap(heap, owner) }.ok_or(E_INVALIDARG)?)
         };
+        if crate::diagnostics::gpu_memory::enabled() && heap.is_some() && !counts.is_null() {
+            // SAFETY: a non-null count array has one entry per range, which
+            // the native call below reads as well. Approximate: NULL and
+            // reused ranges are counted like mapped ones.
+            let tiles = unsafe { core::slice::from_raw_parts(counts, range_count as usize) };
+            crate::diagnostics::gpu_memory::tiles_mapped(tiles.iter().map(|n| u64::from(*n)).sum());
+        }
         unsafe {
             queue.native.UpdateTileMappings(
                 &resource.native,

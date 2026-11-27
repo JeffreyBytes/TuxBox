@@ -125,7 +125,9 @@ impl Mirror {
                     &mut out,
                 )?;
             }
-            out.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))
+            let out: ID3D12Resource = out.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+            crate::diagnostics::gpu_memory::committed(&out, crate::diagnostics::gpu_memory::Origin::Internal);
+            Ok::<_, windows::core::Error>(out)
         };
         let color = allocate(
             &D3D12_RESOURCE_DESC {

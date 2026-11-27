@@ -80,6 +80,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
     // The count is zero for every boot that has not hit that path.
     crate::device::snapshot_cbv_mirrors();
     crate::device::sync_shadow_imports();
+    crate::diagnostics::gpu_memory::tick();
     let device_key = parent(&queue.parent).addr();
     // A guest Reset can replace the tail of a split recording. Hold every
     // such tail through ExecuteCommandLists just as each wait owns its prefix.

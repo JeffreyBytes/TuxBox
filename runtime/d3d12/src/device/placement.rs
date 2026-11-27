@@ -119,6 +119,7 @@ pub(crate) struct Texture {
 impl Drop for Texture {
     fn drop(&mut self) {
         crate::exports::profiling::mapping_released();
+        crate::diagnostics::gpu_memory::host_ram_released(crate::diagnostics::gpu_memory::Slot::SnapshotRam, self.size);
         let Some(images) = self.images.upgrade() else {
             return;
         };
@@ -256,6 +257,7 @@ impl Texture {
             D3D12_RESOURCE_STATE_COMMON,
             clear,
         )?;
+        crate::diagnostics::gpu_memory::committed(&native, crate::diagnostics::gpu_memory::Origin::GuestTextureCopy);
         let mut mips = Vec::with_capacity(count as usize);
         for index in 0..count {
             let (slice, level, element_bytes, source) = if let Some(p) = &plane {
@@ -311,6 +313,8 @@ impl Texture {
             previous: vec![Vec::new(); mips.len()],
             ..Default::default()
         });
+        // `Contents::previous` grows to one CPU copy of every uploaded mip.
+        crate::diagnostics::gpu_memory::host_ram(crate::diagnostics::gpu_memory::Slot::SnapshotRam, size);
         Ok(Arc::new(Self {
             native,
             desc: *desc,

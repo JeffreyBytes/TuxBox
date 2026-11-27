@@ -117,6 +117,9 @@ pub(super) unsafe extern "system" fn create(
     } {
         return error.code();
     }
+    if let Some(native) = &native {
+        crate::diagnostics::gpu_memory::reserved(native);
+    }
     let properties = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()

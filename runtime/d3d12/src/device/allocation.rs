@@ -264,6 +264,7 @@ impl InitTransition {
                 ..Default::default()
             };
             let range_start = 0u32;
+            crate::diagnostics::gpu_memory::tiles_mapped(u64::from(*tiles));
             unsafe {
                 self.queue.UpdateTileMappings(
                     resource,
